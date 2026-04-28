@@ -20,6 +20,43 @@ const getCategoryIcon = (category: string) => {
   return <Layers className="w-5 h-5 text-zinc-400" />;
 }
 
+const ALLOWED_COLUMN_TYPES = new Set(['text', 'select', 'date', 'status', 'number', 'checkbox', 'formula', 'relation']);
+
+function normalizeAiDatabasePayload(payload: any, fallbackTitle: string) {
+  const root = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+  const schemaInput = Array.isArray(root?.schema)
+    ? root.schema
+    : Array.isArray(root?.columns)
+      ? root.columns
+      : [];
+
+  const schema = schemaInput
+    .map((col: any, index: number) => {
+      const name = String(col?.name || col?.label || col?.key || `Column ${index + 1}`).trim();
+      const key = String(col?.key || name.toLowerCase().replace(/[^a-z0-9]+/g, '_')).replace(/^_+|_+$/g, '') || `col_${index + 1}`;
+      const rawType = String(col?.type || 'text').toLowerCase().trim();
+      const type = ALLOWED_COLUMN_TYPES.has(rawType) ? rawType : 'text';
+      const options = (type === 'select' || type === 'status')
+        ? (Array.isArray(col?.options) ? col.options : []).map((opt: any) => String(opt).trim()).filter(Boolean)
+        : [];
+
+      return { key, name, type, options };
+    })
+    .filter((col: any, index: number, arr: any[]) => col.name && arr.findIndex(c => c.key === col.key) === index);
+
+  const initialTasks = Array.isArray(root?.initialTasks)
+    ? root.initialTasks
+    : Array.isArray(root?.tasks)
+      ? root.tasks
+      : [];
+
+  return {
+    title: String(root?.title || fallbackTitle || 'AI Generated DB').trim(),
+    schema,
+    initialTasks,
+  };
+}
+
 export function Sidebar() {
   const { user } = useAuth();
   const navigate = useNavigate();
@@ -107,13 +144,9 @@ export function Sidebar() {
       const res = await askGeminiForDatabaseSchema(
         `Create a Notion-like database schema for: "${aiPrompt}". Provide a relevant title, 4-8 schema columns containing a good mix of types ('text', 'select', 'date', 'status', 'number', 'checkbox', 'formula', 'relation') that optimally fit this topic. Ensure realistic and varied select/status options and diverse content.`
       );
-      const data = safeJsonParse(res) || {};
-      const schema = (Array.isArray(data.schema) ? data.schema : []).map((c: any) => ({
-        key: c.key || c.name?.toLowerCase().replace(/\s+/g, '') || '',
-        name: c.name || 'Untitled',
-        type: c.type || 'text',
-        options: c.options || []
-      }));
+      const parsed = safeJsonParse(res) || {};
+      const data = normalizeAiDatabasePayload(parsed, aiPrompt);
+      const schema = data.schema;
 
       const dbDoc = await addDoc(collection(db, 'pages'), {
         title: data.title || 'AI Generated DB',
