@@ -1,448 +1,800 @@
-import { useParams } from "react-router-dom";
-import React, { useEffect, useState, useRef } from "react";
-import { doc, onSnapshot, updateDoc, serverTimestamp } from "firebase/firestore";
-import { db } from "../lib/firebase";
-import { handleFirestoreError, OperationType } from "../lib/api";
-import { v4 as uuidv4 } from "uuid";
-import { Sparkles, CheckCircle2, Circle, Code2 } from "lucide-react";
-import { askGemini, safeJsonParse } from "../lib/ai";
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../components/ui/dialog';
-import { Button } from '../components/ui/button';
-import { Input } from '../components/ui/input';
+/**
+ * TaskFlow — Cloudflare Worker Backend (taskflow-worker.js)
+ *
+ * Routes:
+ *   POST /api/ai/document     – Document AI assistant (streaming, think-block stripped)
+ *   POST /api/ai/database     – Database schema generation (JSON, non-streaming)
+ *   POST /api/firebase/pages  – Proxy Firestore pages (list / get)
+ *   POST /api/firebase/write  – Proxy Firestore writes (create / update / delete)
+ *   GET  /health              – Health check
+ *
+ * Secrets (add via `wrangler secret put`):
+ *   K2_API_KEY             – MBZUAI K2-Think API key
+ *   FIREBASE_PROJECT_ID    – e.g. gen-lang-client-0240001721
+ *   FIREBASE_API_KEY       – Web API key for Firestore REST auth
+ *   FIREBASE_DATABASE_ID   – e.g. ai-studio-05c871ae-cd99-4565-b716-7b5063384beb
+ *
+ * Deploy:
+ *   wrangler deploy taskflow-worker.js --name taskflow-backend
+ */
 
-type Block = { id: string; type: string; text: string };
-type ChatMessage = { role: 'user' | 'model', text: string };
+// ─── CONSTANTS ────────────────────────────────────────────────────────────────
 
-const getBlockPlaceholder = (type: string) => {
-  if (type === 'h1') return 'Heading 1';
-  if (type === 'h2') return 'Heading 2';
-  if (type === 'quote') return 'Quote';
-  if (type === 'code') return 'Code block';
-  if (type === 'callout') return 'Callout';
-  return "Type '/' for commands...";
+const K2_MODEL   = 'MBZUAI-IFM/K2-Think-v2';
+const K2_API_URL = 'https://api.k2think.ai/v1/chat/completions';
+
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
-const getBlockClassName = (block: Block) => {
-  if (block.type === 'h1') return 'text-3xl font-bold tracking-tight mt-8 mb-4 text-zinc-900';
-  if (block.type === 'h2') return 'text-2xl font-semibold tracking-tight mt-6 mb-3 text-zinc-800';
-  if (block.type === 'quote') return 'text-base italic leading-relaxed border-l-4 border-zinc-300 pl-4 text-zinc-600';
-  if (block.type === 'code') return 'text-sm font-mono leading-6 bg-zinc-900 text-zinc-100 rounded-md px-3 py-2';
-  if (block.type === 'callout') return 'text-base leading-relaxed bg-amber-50 border border-amber-200 rounded-md px-3 py-2 text-amber-900';
-  return 'text-base leading-relaxed';
-};
+const jsonResp = (d, s = 200) =>
+  new Response(JSON.stringify(d), {
+    status: s,
+    headers: { ...CORS_HEADERS, 'Content-Type': 'application/json' },
+  });
+const errResp = (m, s = 500) => jsonResp({ error: m }, s);
+const corsOk  = ()            => new Response(null, { status: 204, headers: CORS_HEADERS });
 
-const renderMarkdownText = (text: string) => {
-  const lines = text.split('\n');
-  const elements: React.ReactNode[] = [];
-  let inCode = false;
-  let codeBuffer: string[] = [];
-  let listBuffer: string[] = [];
+// ─── THINK-BLOCK STRIPPER (identical logic to researchassistant.js) ───────────
 
-  const flushList = () => {
-    if (!listBuffer.length) return;
-    elements.push(
-      <ul key={`list-${elements.length}`} className="list-disc list-inside space-y-1">
-        {listBuffer.map((item, idx) => <li key={idx}>{item}</li>)}
-      </ul>
-    );
-    listBuffer = [];
-  };
+function stripThinkBlocks(text) {
+  return text
+    .replace(/<think>[\s\S]*?<\/think>/g, '')   // complete think blocks
+    .replace(/<think>[\s\S]*/g, '')              // incomplete / cut-off think block
+    .replace(/^\s*(Certainly!|Sure!|Of course!|Great question!|Absolutely!)[^\n]*\n/i, '')
+    .trim();
+}
 
-  const flushCode = () => {
-    if (!codeBuffer.length) return;
-    elements.push(
-      <pre key={`code-${elements.length}`} className="bg-zinc-900 text-zinc-100 text-xs rounded-md p-3 overflow-x-auto font-mono">
-        {codeBuffer.join('\n')}
-      </pre>
-    );
-    codeBuffer = [];
-  };
+// ─── STREAMING RESPONSE (same pattern as researchassistant.js) ────────────────
 
-  for (const line of lines) {
-    if (line.trim().startsWith('```')) {
-      if (inCode) {
-        flushCode();
-        inCode = false;
-      } else {
-        flushList();
-        inCode = true;
+function buildStreamResponse(k2Response) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const enc    = new TextEncoder();
+  const dec    = new TextDecoder();
+
+  (async () => {
+    const reader     = k2Response.body.getReader();
+    let   buf        = '';
+    let   thinkBuf   = '';
+    let   pastThink  = false;
+
+    const flush = async (token) => {
+      if (!token) return;
+      const payload = JSON.stringify({ choices: [{ delta: { content: token } }] });
+      await writer.write(enc.encode(`data: ${payload}\n\n`));
+    };
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (raw === '[DONE]') continue;
+
+          let parsed;
+          try { parsed = JSON.parse(raw); } catch { continue; }
+
+          const token = parsed.choices?.[0]?.delta?.content;
+          if (!token) continue;
+
+          if (pastThink) {
+            await flush(token);
+          } else {
+            thinkBuf += token;
+            // Prevent unbounded think buffer
+            if (thinkBuf.length > 32000) thinkBuf = thinkBuf.slice(-1000);
+
+            if (thinkBuf.includes('</think>')) {
+              const parts = thinkBuf.split('</think>');
+              const after = parts[parts.length - 1]
+                .replace(/^\s*(Certainly!|Sure!|Of course!)[^\n]*\n?/i, '');
+              pastThink = true;
+              thinkBuf  = '';
+              if (after) await flush(after);
+            }
+          }
+        }
       }
-      continue;
+
+      // Fallback: model didn't emit <think> at all — flush raw buffer
+      if (!pastThink && thinkBuf.trim()) {
+        const cleaned = stripThinkBlocks(thinkBuf);
+        if (cleaned) await flush(cleaned);
+      }
+
+    } catch (err) {
+      console.error('Stream processing error:', err);
+      try { await writer.abort(err); } catch {}
+      return;
     }
 
-    if (inCode) {
-      codeBuffer.push(line);
-      continue;
+    try {
+      await writer.write(enc.encode('data: [DONE]\n\n'));
+      await writer.close();
+    } catch {}
+  })();
+
+  return new Response(readable, {
+    headers: {
+      ...CORS_HEADERS,
+      'Content-Type':  'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection':    'keep-alive',
+    },
+  });
+}
+
+// ─── K2 CALLER (with 3-attempt retry) ────────────────────────────────────────
+
+async function callK2(messages, env, stream = true) {
+  let k2Res;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      k2Res = await fetch(K2_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${env.K2_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model:         K2_MODEL,
+          messages,
+          temperature:   0.75,
+          top_p:         0.90,
+          max_tokens:    8000,
+          budget_tokens: 2500,
+          stream,
+        }),
+      });
+
+      if (k2Res.ok) break;
+      const errText = await k2Res.text();
+      console.error(`K2 attempt ${attempt + 1} failed: ${k2Res.status} ${errText}`);
+      if (k2Res.status < 500 && k2Res.status !== 429) break;
+      await new Promise(r => setTimeout(r, 1200 * (attempt + 1)));
+
+    } catch (e) {
+      console.error(`K2 fetch error attempt ${attempt + 1}:`, e);
+      await new Promise(r => setTimeout(r, 1200 * (attempt + 1)));
     }
+  }
+  return k2Res;
+}
 
-    if (line.startsWith('- ')) {
-      listBuffer.push(line.slice(2));
-      continue;
-    }
+// ─── SYSTEM PROMPTS ───────────────────────────────────────────────────────────
 
-    flushList();
+const DOCUMENT_SYSTEM = `You are an expert writing assistant embedded in a Notion-like document editor called Stremini Planner.
+The user may ask you to draft content, summarize, rewrite, extend, or restructure the document.
 
-    if (!line.trim()) continue;
-    if (line.startsWith('## ')) elements.push(<h4 key={`h4-${elements.length}`} className="font-semibold text-zinc-800">{line.slice(3)}</h4>);
-    else if (line.startsWith('# ')) elements.push(<h3 key={`h3-${elements.length}`} className="font-semibold text-zinc-900">{line.slice(2)}</h3>);
-    else elements.push(<p key={`p-${elements.length}`} className="leading-relaxed">{line}</p>);
+RESPONSE FORMAT: Return ONLY a single valid JSON object. No markdown fences. No prose. No explanation outside the JSON.
+
+Schema:
+{
+  "action": "replace" | "append",
+  "blocks": [
+    { "id": "b1", "type": "h1"|"h2"|"p"|"todo"|"list"|"quote"|"code", "text": "..." }
+  ]
+}
+
+Block type guide:
+- h1  : Major section title (use sparingly, once per topic)
+- h2  : Subsection heading
+- p   : Regular paragraph — the main body text
+- list: Bullet point (no leading dash in text)
+- todo: Action item / checkbox (no leading bracket in text)
+- quote: Pull quote or key insight
+- code : Code snippet or technical content (monospace)
+
+Rules:
+- "replace" → return ALL blocks needed for the full document
+- "append"  → return ONLY the new blocks to add at the end
+- Always use VARIED block types — never return all-p or all-list
+- IDs must be short unique strings: "b1", "b2", etc.
+- Text must be clean — no leading symbols like "- ", "# ", "[] "
+- NEVER include <think> blocks, markdown, or explanation outside the JSON object
+- Start your output with { and end with }`;
+
+const DATABASE_SYSTEM = `You are a database schema designer for a Notion-like workspace called Stremini Planner.
+Your ENTIRE output must be a single raw JSON object. No markdown. No explanation. No preamble. No trailing text.
+
+Required output structure:
+{"title":"...","schema":[{"key":"...","name":"...","type":"...","options":[]}],"initialTasks":[{"title":"...","properties":{}}]}
+
+Rules:
+- Output MUST start with { and end with } — nothing before or after
+- 5-7 schema columns using a rich mix of: text, select, status, date, number, checkbox
+- Every select/status column MUST have an "options" array with 3-5 realistic values
+- Generate exactly 12 realistic, diverse initialTasks with ALL schema keys populated
+- Dates must be YYYY-MM-DD format within the next 45 days from today
+- Titles must be specific and realistic (not generic like "Task 1")
+- Do NOT use the example keys — invent appropriate keys for the topic
+- NEVER output the schema template itself — output REAL populated data`;
+
+// ─── DOCUMENT AI HANDLER (streaming) ─────────────────────────────────────────
+
+async function handleDocumentAI(req, env) {
+  const body = await req.json();
+  const {
+    message   = '',
+    blocks    = [],
+    history   = [],
+    action    = 'chat',   // 'chat' | 'summarize'
+  } = body;
+
+  const msg = message.trim().slice(0, 4000);
+  if (!msg && action !== 'summarize') return errResp('Empty message.', 400);
+
+  // Build current document context
+  const contentStr = Array.isArray(blocks) && blocks.length
+    ? blocks.map(b => `[${b.type}] ${b.text}`).join('\n')
+    : '(empty document)';
+
+  const systemContent = `${DOCUMENT_SYSTEM}\n\nCurrent document state:\n${contentStr}`;
+
+  const messages = [{ role: 'system', content: systemContent }];
+
+  // Inject last 8 history turns — frontend sends { role, text }, not { role, content }
+  const hist = Array.isArray(history) ? history.slice(-8) : [];
+  for (const h of hist) {
+    const content = h.content || h.text;   // accept both shapes
+    if (h.role && content)
+      messages.push({ role: h.role, content: String(content).slice(0, 2000) });
   }
 
-  flushList();
-  if (inCode) flushCode();
+  const userMsg = action === 'summarize'
+    ? 'Summarize this document concisely. Return new blocks with action "append", starting with a "Summary" h2 heading.'
+    : msg;
 
-  if (!elements.length) return <span>{text}</span>;
-  return <div className="space-y-2">{elements}</div>;
-};
+  messages.push({ role: 'user', content: userMsg });
 
-export function PageView() {
-  const { pageId } = useParams();
-  const [page, setPage] = useState<any>(null);
-  const [blocks, setBlocks] = useState<Block[]>([]);
-  const [title, setTitle] = useState('');
-  
-  const [aiPanelOpen, setAiPanelOpen] = useState(false);
-  const [aiPrompt, setAiPrompt] = useState('');
-  const [isGenerating, setIsGenerating] = useState(false);
-  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
-  const [showClearConfirm, setShowClearConfirm] = useState(false);
-  const [streamingPreview, setStreamingPreview] = useState('');
+  const k2Res = await callK2(messages, env, true);
+  if (!k2Res || !k2Res.ok) {
+    return errResp('AI service temporarily unavailable. Please try again.', 503);
+  }
 
-  useEffect(() => {
-    if (!pageId) return;
-    const unsubscribe = onSnapshot(doc(db, 'pages', pageId), (docSnap) => {
-      if (docSnap.exists()) {
-        const data = docSnap.data();
-        setPage({ id: docSnap.id, ...data });
-        setTitle(data.title || '');
-        try {
-          const parsed = JSON.parse(data.blocks || '[]');
-          setBlocks(Array.isArray(parsed) && parsed.length > 0 ? parsed : [{ id: uuidv4(), type: 'p', text: '' }]);
-        } catch(e) {
-          setBlocks([{ id: uuidv4(), type: 'p', text: '' }]);
-        }
-      }
-    }, (err) => handleFirestoreError(err, OperationType.GET, `pages/${pageId}`));
-    return () => unsubscribe();
-  }, [pageId]);
-
-  const saveBlocks = async (newBlocks: Block[]) => {
-    if (!pageId || !page) return;
-    try {
-      await updateDoc(doc(db, 'pages', pageId), {
-        blocks: JSON.stringify(newBlocks),
-        updatedAt: serverTimestamp()
-      });
-    } catch (e: any) {
-      console.error(e);
-    }
-  };
-
-  const updateTitle = async (newTitle: string) => {
-    setTitle(newTitle);
-    if (!pageId) return;
-    await updateDoc(doc(db, 'pages', pageId), { title: newTitle, updatedAt: serverTimestamp() });
-  };
-
-  const handleBlockChange = (id: string, text: string) => {
-    const newBlocks = blocks.map(b => b.id === id ? { ...b, text } : b);
-    setBlocks(newBlocks);
-  };
-  
-  const handleBlockBlur = () => {
-    saveBlocks(blocks);
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>, id: string, index: number) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      // Add generic block below
-      const text = blocks[index].text;
-      
-      // Basic markdown parsing to change type
-      const newBlocks = [...blocks];
-      if (text.startsWith('# ')) {
-        newBlocks[index] = { ...newBlocks[index], text: text.slice(2), type: 'h1' };
-      } else if (text.startsWith('## ')) {
-        newBlocks[index] = { ...newBlocks[index], text: text.slice(3), type: 'h2' };
-      } else if (text.startsWith('- ')) {
-        newBlocks[index] = { ...newBlocks[index], text: text.slice(2), type: 'list' };
-      } else if (text.startsWith('> ')) {
-        newBlocks[index] = { ...newBlocks[index], text: text.slice(2), type: 'quote' };
-      } else if (text.startsWith('```')) {
-        newBlocks[index] = { ...newBlocks[index], text: text.replace(/^```/, '').trim(), type: 'code' };
-      } else if (text.startsWith('! ')) {
-        newBlocks[index] = { ...newBlocks[index], text: text.slice(2), type: 'callout' };
-      } else if (text.startsWith('[] ')) {
-        newBlocks[index] = { ...newBlocks[index], text: text.slice(3), type: 'todo' };
-      }
-      
-      const newBlockId = uuidv4();
-      newBlocks.splice(index + 1, 0, { id: newBlockId, type: newBlocks[index].type === 'list' || newBlocks[index].type === 'todo' ? newBlocks[index].type : 'p', text: '' });
-      setBlocks(newBlocks);
-      
-      setTimeout(() => document.getElementById(`block-${newBlockId}`)?.focus(), 10);
-    } else if (e.key === 'Backspace' && blocks[index].text === '' && blocks.length > 1) {
-      e.preventDefault();
-      const newBlocks = blocks.filter(b => b.id !== id);
-      setBlocks(newBlocks);
-      const prevId = blocks[index - 1]?.id || blocks[0].id;
-      setTimeout(() => document.getElementById(`block-${prevId}`)?.focus(), 10);
-    }
-  };
-
-  const runAiCommand = async () => {
-    if (!aiPrompt || !pageId) return;
-    setIsGenerating(true);
-    
-    const userPrompt = aiPrompt;
-    setChatHistory(h => [...h, { role: 'user', text: userPrompt }]);
-    setAiPrompt('');
-    setStreamingPreview('');
-
-    try {
-      const contentStr = blocks.map(b => `[${b.type}] ${b.text}`).join('\n');
-      const instruction = `You are a helpful writing assistant working on a document. 
-Current Document state:
-${contentStr}
-
-Task: Return ONLY a valid JSON object matching the requested schema. If the user asks to summarize, rewrite, or replace the text, set action to "replace" and return ALL blocks. If the user asks to continue, add, or append to the text, set action to "append" and return ONLY the new blocks. CRITICAL: Use more varied block types ('h1', 'h2', 'p', 'todo', 'list') to provide rich and meaningful structure based on the request and context.`;
-      
-      const res = await askGemini(instruction, userPrompt, true, chatHistory);
-      const parsed = safeJsonParse(res);
-      setStreamingPreview(res);
-      
-      if (parsed && Array.isArray(parsed.blocks)) {
-        let newBlocks = blocks;
-        if (parsed.action === 'replace') {
-          newBlocks = parsed.blocks.map((b:any)=>({...b, id: uuidv4()}));
-        } else {
-          newBlocks = [...blocks.filter(b => b.text.trim() !== ''), ...parsed.blocks.map((b:any)=>({...b, id: uuidv4()})) ];
-        }
-        setBlocks(newBlocks);
-        await saveBlocks(newBlocks);
-        setChatHistory(h => [...h, { role: 'model', text: `I updated the document (${parsed.action || 'append'}).` }]);
-      } else {
-        setChatHistory(h => [...h, { role: 'model', text: "⚠️ I couldn't modify the document based on that request." }]);
-      }
-    } catch(e) {
-      console.error(e);
-      setChatHistory(h => [...h, { role: 'model', text: "⚠️ Sorry, I encountered an error." }]);
-    } finally {
-      setIsGenerating(false);
-    }
-  };
-
-  const runSummarize = async () => {
-    setIsGenerating(true);
-    setAiPanelOpen(true);
-    setChatHistory(h => [...h, { role: 'user', text: "Summarize this document." }]);
-    try {
-      const contentStr = blocks.map(b => `[${b.type}] ${b.text}`).join('\n');
-      const instruction = `You are a helpful writing assistant. 
-Current Document state:
-${contentStr}
-
-Task: Return ONLY a valid JSON object matching the requested schema with action "append". Summarize the document accurately and concisely based on its current contents. Return the summary as a new block (e.g. type 'p' or 'list').`;
-      const res = await askGemini(instruction, "Summarize this document concisely.", true, chatHistory);
-      const parsed = safeJsonParse(res);
-      if (parsed && Array.isArray(parsed.blocks)) {
-        const newBlocks = [...blocks.filter(b => b.text.trim() !== ''), { id: uuidv4(), type: 'h2', text: 'Summary' }, ...parsed.blocks.map((b:any)=>({...b, id: uuidv4()}))];
-        setBlocks(newBlocks);
-        await saveBlocks(newBlocks);
-        setChatHistory(h => [...h, { role: 'model', text: `I've added a concise summary to the end of the document.` }]);
-      } else {
-        setChatHistory(h => [...h, { role: 'model', text: "⚠️ I couldn't generate a summary." }]);
-      }
-    } catch(e) {
-      console.error(e);
-      setChatHistory(h => [...h, { role: 'model', text: "⚠️ Sorry, I encountered an error while trying to summarize. Please try again." }]);
-    } finally {
-      setIsGenerating(false);
-    }
-  };
-
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [chatHistory, isGenerating]);
-
-  if (!page) return null;
-
-  return (
-    <div className="flex-1 overflow-hidden flex flex-col">
-      {/* Header/Breadcrumbs */}
-      <header className="h-12 w-full flex-shrink-0 flex items-center justify-between px-6 border-b border-[#EDECE9] bg-white">
-        <div className="flex items-center space-x-2 text-sm text-gray-500">
-          <span>Workspace</span>
-          <span>/</span>
-          <span className="text-[#37352F] font-medium">{title || 'Untitled'}</span>
-        </div>
-        <div className="flex items-center space-x-4">
-          <button onClick={runSummarize} className="text-xs text-purple-600 bg-purple-50 hover:bg-purple-100 flex items-center px-3 py-1.5 rounded-md font-medium transition-colors">
-            <Sparkles className="w-3 h-3 mr-1" /> Summarize
-          </button>
-          <button className="text-xs text-gray-500 hover:bg-[#EBEAEA] px-3 py-1.5 rounded-md">Updates</button>
-        </div>
-      </header>
-
-      <div className="flex flex-1 overflow-hidden">
-      <div className="p-12 overflow-y-auto w-full">
-        <div className="max-w-3xl mx-auto w-full">
-          <div className="mb-4 group relative flex items-center gap-4">
-           {/* Replaced massive emoji with a sleek clean design */}
-           <button onClick={() => setAiPanelOpen(!aiPanelOpen)} className="flex items-center text-sm font-medium text-purple-600 hover:text-purple-700 bg-purple-50 hover:bg-purple-100 px-3 py-1.5 rounded-full transition-all mt-4 mb-2">
-             <Sparkles className="w-4 h-4 mr-1.5" /> Continue with AI...
-           </button>
-        </div>
-        
-        <input 
-          className="w-full text-5xl font-bold tracking-tight text-zinc-900 bg-transparent outline-none mb-10 placeholder-zinc-300"
-          placeholder="Untitled"
-          value={title}
-          onChange={e => updateTitle(e.target.value)}
-        />
-
-        <div className="space-y-1 pb-32">
-          {blocks.map((block, i) => (
-            <div key={block.id} className="relative group flex items-start">
-              {block.type === 'todo' && (
-                <div 
-                  className="mt-3 mr-3 cursor-pointer text-zinc-400 hover:text-zinc-600 transition-colors shrink-0"
-                  onClick={() => {
-                    const isChecked = block.text.startsWith('[x]');
-                    const newText = (!isChecked ? '[x] ' : '') + block.text.replace(/^\[x\]\s*/, '');
-                    handleBlockChange(block.id, newText);
-                    saveBlocks(blocks.map(b => b.id === block.id ? { ...b, text: newText } : b));
-                  }}
-                >
-                  {block.text.startsWith('[x]') ? <CheckCircle2 className="w-5 h-5 text-zinc-800" /> : <Circle className="w-5 h-5" />}
-                </div>
-              )}
-              {block.type === 'list' && (
-                <div className="mt-3 mr-3 w-4 h-4 flex items-center justify-center shrink-0">
-                  <div className="w-1.5 h-1.5 bg-zinc-800 rounded-full"></div>
-                </div>
-              )}
-              
-              <textarea
-                id={`block-${block.id}`}
-                value={block.text.replace(/^\[x\]\s*/, '')}
-                onChange={e => {
-                  const prefix = block.type === 'todo' && block.text.startsWith('[x]') ? '[x] ' : '';
-                  handleBlockChange(block.id, prefix + e.target.value);
-                }}
-                onBlur={handleBlockBlur}
-                onKeyDown={e => handleKeyDown(e as any, block.id, i)}
-                rows={1}
-                style={{ height: 'auto' }}
-                onInput={(e) => {
-                  const target = e.target as HTMLTextAreaElement;
-                  target.style.height = 'auto';
-                  target.style.height = target.scrollHeight + 'px';
-                }}
-                className={`w-full bg-transparent outline-none resize-none py-2 min-h-[38px] text-zinc-800 placeholder-zinc-300 overflow-hidden ${getBlockClassName(block)} ${block.type === 'todo' && block.text.startsWith('[x]') ? 'line-through text-zinc-400' : ''}`}
-                placeholder={getBlockPlaceholder(block.type)}
-              />
-            </div>
-          ))}
-        </div>
-      </div>
-      </div>
-      
-      {aiPanelOpen && (
-        <div className="w-80 border-l border-zinc-200 bg-zinc-50 flex flex-col shadow-sm z-10 shrink-0">
-          <div className="h-12 border-b border-zinc-200 flex items-center justify-between px-4 font-medium text-zinc-800">
-            <div className="flex items-center">
-              <Sparkles className="w-4 h-4 text-purple-500 mr-2" /> AI Assistant
-            </div>
-            {chatHistory.length > 0 && (
-              <button 
-                onClick={() => setShowClearConfirm(true)}
-                className="text-xs font-normal text-zinc-400 hover:text-red-500 transition-colors px-2 py-1"
-                title="Clear Chat"
-              >
-                Clear
-              </button>
-            )}
-          </div>
-          <div className="flex-1 overflow-y-auto p-4 space-y-4">
-            {chatHistory.length === 0 && (
-              <div className="text-sm text-zinc-500 text-center mt-4">
-                Ask me to draft content, summarize, or edit the document.
-              </div>
-            )}
-            {chatHistory.map((msg, i) => (
-              <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`text-sm py-2 px-3 rounded-lg max-w-[90%] ${
-                  msg.role === 'user' ? 'bg-purple-600 text-white' : 'bg-white border border-zinc-200 text-zinc-800'
-                }`}>
-                  {msg.role === 'model' ? renderMarkdownText(msg.text) : msg.text}
-                </div>
-              </div>
-            ))}
-            {isGenerating && (
-              <div className="flex justify-start">
-                <div className="bg-white border border-purple-200 shadow-sm text-purple-600 text-sm py-3 px-4 rounded-lg flex items-center space-x-3">
-                  <div className="flex space-x-1.5">
-                    <div className="w-2 h-2 bg-purple-500 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                    <div className="w-2 h-2 bg-purple-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                    <div className="w-2 h-2 bg-purple-300 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                  </div>
-                  <span className="text-xs font-medium animate-pulse">AI is thinking...</span>
-                </div>
-              </div>
-            )}
-            {streamingPreview && (
-              <div className="flex justify-start">
-                <div className="bg-white border border-zinc-200 text-zinc-700 text-xs py-2 px-3 rounded-lg max-w-[90%] space-y-1">
-                  <div className="font-medium flex items-center gap-1 text-zinc-500"><Code2 className="w-3 h-3" /> Live JSON preview</div>
-                  <pre className="whitespace-pre-wrap break-words max-h-24 overflow-y-auto">{streamingPreview}</pre>
-                </div>
-              </div>
-            )}
-            <div ref={messagesEndRef} />
-          </div>
-          <div className="p-4 border-t border-zinc-200 bg-white">
-            <div className="relative">
-              <Input
-                value={aiPrompt}
-                onChange={e => setAiPrompt(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && runAiCommand()}
-                placeholder="Ask AI..."
-                className="pr-10"
-                disabled={isGenerating}
-              />
-              <button 
-                onClick={runAiCommand} 
-                disabled={!aiPrompt || isGenerating}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-purple-600 disabled:opacity-50"
-              >
-                 <Sparkles className="w-4 h-4" />
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      </div>
-
-      <Dialog open={showClearConfirm} onOpenChange={setShowClearConfirm}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Clear Chat History</DialogTitle>
-          </DialogHeader>
-          <p className="text-sm text-zinc-500 mb-4">
-            Are you sure you want to clear the AI chat history for this document? This action cannot be undone.
-          </p>
-          <div className="flex justify-end space-x-3 mt-2">
-            <Button variant="outline" onClick={() => setShowClearConfirm(false)}>Cancel</Button>
-            <Button variant="destructive" onClick={() => {
-              setChatHistory([]);
-              setShowClearConfirm(false);
-            }}>Clear</Button>
-          </div>
-        </DialogContent>
-      </Dialog>
-    </div>
-  );
+  return buildStreamResponse(k2Res);
 }
+
+// ─── DATABASE AI HANDLER ──────────────────────────────────────────────────────
+// K2 is a thinking model — it wraps output in <think>...</think> before the JSON.
+// Strategy: use NON-streaming so we get a single JSON response body — no SSE
+// parsing needed. Extract content from choices[0].message.content, strip think
+// blocks with regex, then pull out the JSON object.
+
+async function handleDatabaseAI(req, env) {
+  const body = await req.json();
+  const { prompt = '' } = body;
+
+  const msg = prompt.trim().slice(0, 2000);
+  if (!msg) return errResp('Empty prompt.', 400);
+
+  const messages = [
+    { role: 'system', content: DATABASE_SYSTEM },
+    {
+      role: 'user',
+      content: `Topic: "${msg}". Output the JSON object now.`,
+    },
+  ];
+
+  // NON-streaming: avoids SSE accumulation bugs entirely.
+  // K2 raw content was length 0 with stream=true because delta.content tokens
+  // weren't being captured before think blocks were stripped.
+  const k2Res = await callK2(messages, env, false);
+  if (!k2Res || !k2Res.ok) {
+    const errText = k2Res ? await k2Res.text().catch(() => '') : 'no response';
+    console.error('K2 database call failed:', k2Res?.status, errText.slice(0, 300));
+    return errResp('AI service temporarily unavailable. Please try again.', 503);
+  }
+
+  let responseJson;
+  try {
+    responseJson = await k2Res.json();
+  } catch (e) {
+    console.error('Failed to parse K2 response as JSON:', e);
+    return errResp('AI returned unparseable response.', 500);
+  }
+
+  // Non-streaming response: content is in choices[0].message.content
+  const full = responseJson?.choices?.[0]?.message?.content ?? '';
+
+  console.log('K2 raw content length:', full.length, '| first 300:', full.slice(0, 300));
+
+  // K2 non-streaming puts thinking prose directly in message.content with no
+  // <think> tags, so stripThinkBlocks() is useless here. Instead, find the
+  // real JSON by scanning for the first { that is immediately followed
+  // (ignoring whitespace) by a '"' — i.e. a JSON object key, not prose.
+  const jsonText = extractRealJsonObject(full);
+  if (!jsonText) {
+    console.error('No JSON object found. first 500:', full.slice(0, 500));
+    console.error('last 300:', full.slice(-300));
+    return errResp('AI returned invalid JSON. Please try a different prompt.', 500);
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch (e) {
+    // Try recovery on truncated JSON
+    const recovered = recoverTruncatedJson(jsonText);
+    if (recovered) {
+      try {
+        parsed = JSON.parse(recovered);
+        console.warn('Recovered truncated JSON. Records:', parsed?.initialTasks?.length);
+      } catch {
+        console.error('Recovery failed. first 500:', jsonText.slice(0, 500));
+        console.error('last 300:', jsonText.slice(-300));
+        return errResp('AI returned invalid JSON. Please try a different prompt.', 500);
+      }
+    } else {
+      console.error('JSON parse + recovery failed. first 500:', jsonText.slice(0, 500));
+      return errResp('AI returned invalid JSON. Please try a different prompt.', 500);
+    }
+  }
+
+  return jsonResp({ ok: true, data: parsed });
+}
+
+// Extract the JSON object from text that may have prose before/after it.
+// Finds the FIRST { and then scans forward tracking depth to find its matching }.
+function extractJsonObject(text) {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return text.slice(start, i + 1);
+    }
+  }
+
+  // Didn't find matching close — return from start to end (truncated)
+  return text.slice(start);
+}
+
+// Like extractJsonObject but skips { chars that are inside prose (thinking text).
+// It only considers a { as the JSON start if the very next non-whitespace char
+// is a '"' — meaning it opens a key-value object, not an English sentence.
+function extractRealJsonObject(text) {
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] !== '{') continue;
+    // peek ahead past whitespace
+    let j = i + 1;
+    while (j < text.length && (text[j] === ' ' || text[j] === '\r' || text[j] === '\n' || text[j] === '\t')) j++;
+    if (text[j] !== '"') continue; // not a JSON object key — skip
+    // depth-track from here
+    let depth = 0, inString = false, escape = false;
+    for (let k = i; k < text.length; k++) {
+      const ch = text[k];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inString) { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) return text.slice(i, k + 1); }
+    }
+    // truncated — return from i to end
+    return text.slice(i);
+  }
+  return null;
+}
+
+// Attempt to recover a truncated JSON object.
+function recoverTruncatedJson(text) {
+  // Try simple suffix appending first
+  const suffixes = ['}', ']}', '}]}', '"}]}', '"]}', '}]}}'];
+  for (const s of suffixes) {
+    try { JSON.parse(text + s); return text + s; } catch {}
+  }
+
+  // Find last complete record: scan backwards for a } that closes a full object
+  for (let i = text.length - 1; i >= 0; i--) {
+    if (text[i] !== '}') continue;
+    const slice = text.slice(0, i + 1);
+    const candidates = [slice + ']}', slice + '\n  ]\n}', slice + ']}  }'];
+    for (const c of candidates) {
+      try { JSON.parse(c); return c; } catch {}
+    }
+  }
+  return null;
+}
+
+
+// ─── FIREBASE REST HELPERS ────────────────────────────────────────────────────
+// We proxy Firestore REST so the frontend never holds Firebase secrets.
+// The worker authenticates using the Firebase Web API Key (REST-only, no Admin SDK needed).
+// For writes that require auth (Firestore rules use request.auth.uid), the frontend
+// sends its Firebase ID token and we forward it.
+
+function firestoreBaseUrl(env) {
+  return `https://firestore.googleapis.com/v1/projects/${env.FIREBASE_PROJECT_ID}/databases/${env.FIREBASE_DATABASE_ID}/documents`;
+}
+
+// Convert a Firestore REST field value to a plain JS value
+function fsValueToJS(val) {
+  if (val === undefined || val === null) return null;
+  if ('stringValue'    in val) return val.stringValue;
+  if ('integerValue'   in val) return parseInt(val.integerValue, 10);
+  if ('doubleValue'    in val) return val.doubleValue;
+  if ('booleanValue'   in val) return val.booleanValue;
+  if ('timestampValue' in val) return val.timestampValue;
+  if ('nullValue'      in val) return null;
+  if ('arrayValue'     in val) return (val.arrayValue.values || []).map(fsValueToJS);
+  if ('mapValue'       in val) return fsDocToObj({ fields: val.mapValue.fields || {} });
+  return null;
+}
+
+// Convert a Firestore REST document to a plain JS object
+function fsDocToObj(doc) {
+  const obj = {};
+  for (const [k, v] of Object.entries(doc.fields || {})) {
+    obj[k] = fsValueToJS(v);
+  }
+  if (doc.name) {
+    const parts = doc.name.split('/');
+    obj.__id = parts[parts.length - 1];
+  }
+  return obj;
+}
+
+// Convert a plain JS value to a Firestore REST field value
+function jsToFsValue(val) {
+  if (val === null || val === undefined) return { nullValue: null };
+  if (typeof val === 'boolean') return { booleanValue: val };
+  if (typeof val === 'number') {
+    return Number.isInteger(val) ? { integerValue: String(val) } : { doubleValue: val };
+  }
+  if (typeof val === 'string') return { stringValue: val };
+  if (Array.isArray(val)) return { arrayValue: { values: val.map(jsToFsValue) } };
+  if (typeof val === 'object') {
+    const fields = {};
+    for (const [k, v] of Object.entries(val)) fields[k] = jsToFsValue(v);
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(val) };
+}
+
+// Convert a plain JS object to Firestore REST fields
+function objToFsFields(obj) {
+  const fields = {};
+  for (const [k, v] of Object.entries(obj)) {
+    // Skip __id and server timestamps (handled separately)
+    if (k === '__id' || k === 'createdAt' || k === 'updatedAt') continue;
+    fields[k] = jsToFsValue(v);
+  }
+  return fields;
+}
+
+// ─── FIREBASE PAGES HANDLER ───────────────────────────────────────────────────
+
+async function handleFirebasePages(req, env) {
+  const body = await req.json();
+  const { op, userId, pageId, idToken } = body;
+  // op: 'list' | 'get'
+
+  if (!userId) return errResp('userId required', 400);
+
+  const baseUrl = firestoreBaseUrl(env);
+  const authHeaders = idToken
+    ? { Authorization: `Bearer ${idToken}` }
+    : { 'x-goog-api-key': env.FIREBASE_API_KEY };
+
+  if (op === 'list') {
+    // Run a structured query to list pages owned by userId
+    const queryUrl = `${baseUrl}:runQuery`;
+    const queryBody = {
+      structuredQuery: {
+        from: [{ collectionId: 'pages' }],
+        where: {
+          fieldFilter: {
+            field: { fieldPath: 'ownerId' },
+            op: 'EQUAL',
+            value: { stringValue: userId },
+          },
+        },
+        orderBy: [{ field: { fieldPath: 'createdAt' }, direction: 'DESCENDING' }],
+        limit: 200,
+      },
+    };
+
+    const res = await fetch(queryUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
+      body: JSON.stringify(queryBody),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      console.error('Firestore list error:', t);
+      return errResp('Firestore list failed: ' + res.status, res.status);
+    }
+
+    const rows = await res.json();
+    const pages = rows
+      .filter(r => r.document)
+      .map(r => fsDocToObj(r.document));
+
+    return jsonResp({ ok: true, pages });
+  }
+
+  if (op === 'get') {
+    if (!pageId) return errResp('pageId required', 400);
+    const res = await fetch(`${baseUrl}/pages/${pageId}`, {
+      headers: authHeaders,
+    });
+
+    if (!res.ok) {
+      return errResp('Page not found', res.status);
+    }
+
+    const doc = await res.json();
+    return jsonResp({ ok: true, page: fsDocToObj(doc) });
+  }
+
+  return errResp('Unknown op', 400);
+}
+
+// ─── FIREBASE WRITE HANDLER ───────────────────────────────────────────────────
+
+async function handleFirebaseWrite(req, env) {
+  const body = await req.json();
+  const {
+    op,          // 'create_page' | 'update_page' | 'delete_page' |
+                 // 'create_record' | 'update_record' | 'delete_record' |
+                 // 'list_records'
+    idToken,     // Firebase ID token from client (required for auth-gated writes)
+    pageId,
+    recordId,
+    data,
+    userId,
+  } = body;
+
+  if (!idToken) return errResp('idToken required for writes', 401);
+
+  const baseUrl    = firestoreBaseUrl(env);
+  const authHdr    = { Authorization: `Bearer ${idToken}` };
+  const contentHdr = { 'Content-Type': 'application/json' };
+
+  const now = new Date().toISOString();
+
+  // ── LIST RECORDS ──
+  if (op === 'list_records') {
+    if (!pageId || !userId) return errResp('pageId and userId required', 400);
+
+    const queryUrl  = `${baseUrl}:runQuery`;
+    const queryBody = {
+      structuredQuery: {
+        from: [{ collectionId: 'records' }],
+        where: {
+          compositeFilter: {
+            op: 'AND',
+            filters: [
+              { fieldFilter: { field: { fieldPath: 'databaseId' }, op: 'EQUAL', value: { stringValue: pageId } } },
+              { fieldFilter: { field: { fieldPath: 'ownerId' },    op: 'EQUAL', value: { stringValue: userId } } },
+            ],
+          },
+        },
+        orderBy: [{ field: { fieldPath: 'createdAt' }, direction: 'DESCENDING' }],
+        limit: 500,
+      },
+    };
+
+    const res = await fetch(queryUrl, {
+      method: 'POST',
+      headers: { ...contentHdr, ...authHdr },
+      body: JSON.stringify(queryBody),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      return errResp('Firestore records query failed: ' + t, res.status);
+    }
+
+    const rows    = await res.json();
+    const records = rows.filter(r => r.document).map(r => fsDocToObj(r.document));
+    return jsonResp({ ok: true, records });
+  }
+
+  // ── CREATE PAGE ──
+  if (op === 'create_page') {
+    if (!data) return errResp('data required', 400);
+    const fields = objToFsFields({ ...data, createdAt: now, updatedAt: now });
+    // Add server-managed timestamps as string values (REST API doesn't support serverTimestamp here)
+    fields.createdAt = { timestampValue: now };
+    fields.updatedAt = { timestampValue: now };
+
+    const res = await fetch(`${baseUrl}/pages`, {
+      method: 'POST',
+      headers: { ...contentHdr, ...authHdr },
+      body: JSON.stringify({ fields }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      return errResp('Create page failed: ' + t, res.status);
+    }
+
+    const doc = await res.json();
+    return jsonResp({ ok: true, page: fsDocToObj(doc) });
+  }
+
+  // ── UPDATE PAGE ──
+  if (op === 'update_page') {
+    if (!pageId || !data) return errResp('pageId and data required', 400);
+    const fields = objToFsFields({ ...data, updatedAt: now });
+    fields.updatedAt = { timestampValue: now };
+
+    // Build updateMask from provided data keys
+    const updateMaskFields = Object.keys(data)
+      .filter(k => k !== '__id' && k !== 'createdAt')
+      .concat(['updatedAt'])
+      .map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
+      .join('&');
+
+    const res = await fetch(`${baseUrl}/pages/${pageId}?${updateMaskFields}`, {
+      method: 'PATCH',
+      headers: { ...contentHdr, ...authHdr },
+      body: JSON.stringify({ fields }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      return errResp('Update page failed: ' + t, res.status);
+    }
+
+    const doc = await res.json();
+    return jsonResp({ ok: true, page: fsDocToObj(doc) });
+  }
+
+  // ── DELETE PAGE ──
+  if (op === 'delete_page') {
+    if (!pageId) return errResp('pageId required', 400);
+    const res = await fetch(`${baseUrl}/pages/${pageId}`, {
+      method: 'DELETE',
+      headers: authHdr,
+    });
+
+    if (!res.ok && res.status !== 404) {
+      const t = await res.text();
+      return errResp('Delete page failed: ' + t, res.status);
+    }
+
+    return jsonResp({ ok: true });
+  }
+
+  // ── CREATE RECORD ──
+  if (op === 'create_record') {
+    if (!data) return errResp('data required', 400);
+    const fields = objToFsFields({ ...data });
+    fields.createdAt = { timestampValue: now };
+    fields.updatedAt = { timestampValue: now };
+
+    const res = await fetch(`${baseUrl}/records`, {
+      method: 'POST',
+      headers: { ...contentHdr, ...authHdr },
+      body: JSON.stringify({ fields }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      return errResp('Create record failed: ' + t, res.status);
+    }
+
+    const doc = await res.json();
+    return jsonResp({ ok: true, record: fsDocToObj(doc) });
+  }
+
+  // ── UPDATE RECORD ──
+  if (op === 'update_record') {
+    if (!recordId || !data) return errResp('recordId and data required', 400);
+    const fields = objToFsFields({ ...data });
+    fields.updatedAt = { timestampValue: now };
+
+    const updateMaskFields = Object.keys(data)
+      .filter(k => k !== '__id' && k !== 'createdAt')
+      .concat(['updatedAt'])
+      .map(k => `updateMask.fieldPaths=${encodeURIComponent(k)}`)
+      .join('&');
+
+    const res = await fetch(`${baseUrl}/records/${recordId}?${updateMaskFields}`, {
+      method: 'PATCH',
+      headers: { ...contentHdr, ...authHdr },
+      body: JSON.stringify({ fields }),
+    });
+
+    if (!res.ok) {
+      const t = await res.text();
+      return errResp('Update record failed: ' + t, res.status);
+    }
+
+    const doc = await res.json();
+    return jsonResp({ ok: true, record: fsDocToObj(doc) });
+  }
+
+  // ── DELETE RECORD ──
+  if (op === 'delete_record') {
+    if (!recordId) return errResp('recordId required', 400);
+    const res = await fetch(`${baseUrl}/records/${recordId}`, {
+      method: 'DELETE',
+      headers: authHdr,
+    });
+
+    if (!res.ok && res.status !== 404) {
+      const t = await res.text();
+      return errResp('Delete record failed: ' + t, res.status);
+    }
+
+    return jsonResp({ ok: true });
+  }
+
+  return errResp('Unknown op', 400);
+}
+
+// ─── HEALTH CHECK ─────────────────────────────────────────────────────────────
+
+function handleHealth(env) {
+  return jsonResp({
+    status:  'ok',
+    service: 'taskflow-backend',
+    model:   K2_MODEL,
+    routes: [
+      'POST /api/ai/document',
+      'POST /api/ai/database',
+      'POST /api/firebase/pages',
+      'POST /api/firebase/write',
+    ],
+    firebaseProject: env?.FIREBASE_PROJECT_ID || '(not set)',
+  });
+}
+
+// ─── ROUTER ───────────────────────────────────────────────────────────────────
+
+export default {
+  async fetch(request, env) {
+    if (request.method === 'OPTIONS') return corsOk();
+
+    const { pathname } = new URL(request.url);
+
+    // Health
+    if (request.method === 'GET' && pathname === '/health') return handleHealth(env);
+
+    if (request.method !== 'POST') return errResp('Method not allowed', 405);
+
+    try {
+      // AI routes
+      if (pathname === '/api/ai/document')  return await handleDocumentAI(request, env);
+      if (pathname === '/api/ai/database')  return await handleDatabaseAI(request, env);
+
+      // Firebase proxy routes
+      if (pathname === '/api/firebase/pages') return await handleFirebasePages(request, env);
+      if (pathname === '/api/firebase/write') return await handleFirebaseWrite(request, env);
+
+    } catch (err) {
+      console.error('Handler error:', err);
+      return errResp(err.message || 'Internal server error', 500);
+    }
+
+    return errResp('Not found', 404);
+  },
+};
