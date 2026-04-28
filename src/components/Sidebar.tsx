@@ -65,6 +65,13 @@ export function Sidebar() {
   const [isTemplateDialogOpen, setIsTemplateDialogOpen] = useState(false);
   const [aiPrompt, setAiPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
+  const [aiLoadingStep, setAiLoadingStep] = useState(0);
+  const loadingSteps = [
+    'Planning schema…',
+    'Designing columns…',
+    'Balancing field types…',
+    'Finalizing starter rows…'
+  ];
 
   useEffect(() => {
     if (!user) return;
@@ -140,6 +147,10 @@ export function Sidebar() {
   const createWithAI = async () => {
     if (!user || !aiPrompt) return;
     setIsGenerating(true);
+    setAiLoadingStep(0);
+    const interval = window.setInterval(() => {
+      setAiLoadingStep(prev => (prev + 1) % loadingSteps.length);
+    }, 850);
     try {
       const res = await askGeminiForDatabaseSchema(
         `Create a Notion-like database schema for: "${aiPrompt}". Provide a relevant title, 4-8 schema columns containing a good mix of types ('text', 'select', 'date', 'status', 'number', 'checkbox', 'formula', 'relation') that optimally fit this topic. Ensure realistic and varied select/status options and diverse content.`
@@ -179,7 +190,9 @@ export function Sidebar() {
       console.error(e);
       alert('AI Generation failed. ' + e.message);
     } finally {
+      window.clearInterval(interval);
       setIsGenerating(false);
+      setAiLoadingStep(0);
     }
   }
 
@@ -302,6 +315,14 @@ export function Sidebar() {
              <Button className="w-full" disabled={!aiPrompt || isGenerating} onClick={createWithAI}>
                {isGenerating ? <><Sparkles className="mr-2 h-4 w-4 animate-pulse" /> Generating...</> : 'Generate'}
              </Button>
+             {isGenerating && (
+              <div className="rounded-md border border-purple-200 bg-purple-50 p-3 space-y-2">
+                <div className="h-1.5 w-full bg-purple-100 rounded-full overflow-hidden">
+                  <div className="h-full bg-purple-500 rounded-full animate-pulse" style={{ width: `${((aiLoadingStep + 1) / loadingSteps.length) * 100}%` }} />
+                </div>
+                <div className="text-xs text-purple-700 font-medium">{loadingSteps[aiLoadingStep]}</div>
+              </div>
+             )}
           </div>
         </DialogContent>
       </Dialog>

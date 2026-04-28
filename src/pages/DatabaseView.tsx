@@ -4,8 +4,7 @@ import { collection, query, where, onSnapshot, doc, addDoc, updateDoc, serverTim
 import { db } from "../lib/firebase";
 import { handleFirestoreError, OperationType } from "../lib/api";
 import { useAuth } from "../lib/AuthContext";
-import { Plus, MoreHorizontal, Settings2 } from "lucide-react";
-import { format } from "date-fns";
+import { Plus, Settings2, ChevronDown } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../components/ui/dialog';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
@@ -21,6 +20,20 @@ export function DatabaseView() {
   const [newColName, setNewColName] = useState('');
   const [newColType, setNewColType] = useState('text');
   const [newColOptions, setNewColOptions] = useState('');
+
+  const getSelectColor = (value: string) => {
+    if (!value) return 'bg-zinc-100 text-zinc-500 border-zinc-200';
+    const palette = [
+      'bg-blue-100 text-blue-800 border-blue-200',
+      'bg-emerald-100 text-emerald-800 border-emerald-200',
+      'bg-amber-100 text-amber-800 border-amber-200',
+      'bg-purple-100 text-purple-800 border-purple-200',
+      'bg-rose-100 text-rose-800 border-rose-200',
+      'bg-cyan-100 text-cyan-800 border-cyan-200',
+    ];
+    const hash = value.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0);
+    return palette[hash % palette.length];
+  };
 
   useEffect(() => {
     if (!pageId || !user) return;
@@ -187,8 +200,12 @@ export function DatabaseView() {
                       <td key={col.key} className="py-2 px-4 border-r border-zinc-100 last:border-0">
                         {col.type === 'select' || col.type === 'status' ? (
                            <div className="relative">
+                             <div className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs font-medium ${getSelectColor(props[col.key] || '')}`}>
+                               <span>{props[col.key] || 'Empty'}</span>
+                               <ChevronDown className="w-3 h-3 opacity-70" />
+                             </div>
                              <select 
-                               className="appearance-none w-full bg-transparent outline-none cursor-pointer hover:bg-zinc-100/80 rounded px-2 py-1 -ml-2 transition-colors text-zinc-700"
+                               className="absolute inset-0 opacity-0 cursor-pointer"
                                value={props[col.key] || ''}
                                onChange={e => updateRecordProp(record.id, record.properties, col.key, e.target.value)}
                              >
