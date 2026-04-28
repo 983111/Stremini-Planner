@@ -1,135 +1,147 @@
-import { GoogleGenAI, Type } from "@google/genai";
+/**
+ * src/lib/ai.ts
+ * All AI calls now go through the Cloudflare Worker backend.
+ * No Gemini API key needed on the frontend.
+ *
+ * Set VITE_WORKER_URL in your .env.local:
+ *   VITE_WORKER_URL=https://taskflow-backend.<your-subdomain>.workers.dev
+ */
 
-let aiClient: GoogleGenAI | null = null;
+const WORKER_URL = import.meta.env.VITE_WORKER_URL || '';
 
-export function getAI() {
-  if (!aiClient) {
-    if (!process.env.GEMINI_API_KEY) {
-      throw new Error("GEMINI_API_KEY is not defined");
-    }
-    aiClient = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  }
-  return aiClient;
+if (!WORKER_URL) {
+  console.warn('[ai.ts] VITE_WORKER_URL is not set. AI calls will fail.');
 }
+
+// ─── JSON SAFE-PARSE (unchanged from original) ────────────────────────────────
 
 export function safeJsonParse(jsonStr: string) {
   let text = jsonStr.trim();
-  if (text.startsWith('```json')) {
-    text = text.substring(7);
-  } else if (text.startsWith('```')) {
-    text = text.substring(3);
-  }
-  if (text.endsWith('```')) {
-    text = text.substring(0, text.length - 3);
-  }
+  if (text.startsWith('```json')) text = text.substring(7);
+  else if (text.startsWith('```'))  text = text.substring(3);
+  if (text.endsWith('```'))         text = text.substring(0, text.length - 3);
   text = text.trim();
+
   try {
     return JSON.parse(text);
   } catch (e) {
-    console.warn("JSON parse failed, attempting heuristic repair:", e);
-    
-    // Quick heuristic for truncated JSON from LLMs
-    const lastBrace = text.lastIndexOf('}');
+    console.warn('JSON parse failed, attempting heuristic repair:', e);
+
+    const lastBrace   = text.lastIndexOf('}');
     const lastBracket = text.lastIndexOf(']');
-    
-    let lastValid = Math.max(lastBrace, lastBracket);
+    const lastValid   = Math.max(lastBrace, lastBracket);
+
     if (lastValid > -1) {
-      // Try closing array/object combinations
-      const endings = ['', '}', ']', ']}', '}]', '}]}', ']}]', '"}', '"]}', '"}', '"]'];
-      
+      const endings = ['', '}', ']', ']}', '}]', '}]}', ']}]', '"}', '"]}'];
       for (const end of endings) {
-        try {
-          return JSON.parse(text.substring(0, lastValid + 1) + end);
-        } catch (err) {}
+        try { return JSON.parse(text.substring(0, lastValid + 1) + end); } catch {}
       }
     }
-    
-    // Fallback if we really can't repair it
-    try {
-        // Find the last complete block or key
-        const safeCut = text.substring(0, text.lastIndexOf(','));
-        const endings = ['}', ']', ']}', '}]'];
-        for (const end of endings) {
-            try { return JSON.parse(safeCut + end); } catch(err) {} 
-        }
-    } catch (fallbackErr) {}
 
-    // Ultimate fallback returning empty structure that matches most expectations
+    try {
+      const safeCut = text.substring(0, text.lastIndexOf(','));
+      for (const end of ['}', ']', ']}', '}]']) {
+        try { return JSON.parse(safeCut + end); } catch {}
+      }
+    } catch {}
+
     return { blocks: [], schema: [], error: true };
   }
 }
 
-export async function askGemini(systemInstruction: string, prompt: string, includeSchema = false, history: { role: 'user' | 'model', text: string }[] = []) {
-  const ai = getAI();
-  const config: any = { systemInstruction };
-  
-  if (includeSchema) {
-    config.responseMimeType = "application/json";
-    config.responseSchema = {
-       type: Type.OBJECT,
-       properties: {
-          action: { type: Type.STRING, description: "'replace' or 'append'" },
-          blocks: {
-            type: Type.ARRAY,
-            items: {
-              type: Type.OBJECT,
-              properties: {
-                id: { type: Type.STRING },
-                type: { type: Type.STRING, description: "'h1', 'h2', 'p', 'todo', 'list'" },
-                text: { type: Type.STRING }
-              }
-            }
-          }
-       }
-    };
+// ─── DOCUMENT AI (streaming) ──────────────────────────────────────────────────
+/**
+ * Calls /api/ai/document on the Worker.
+ * Returns an async generator that yields string tokens stripped of think blocks.
+ *
+ * Usage:
+ *   for await (const token of streamDocumentAI({ message, blocks, history })) {
+ *     // append token to UI
+ *   }
+ */
+export async function* streamDocumentAI(params: {
+  message?: string;
+  blocks?: { id: string; type: string; text: string }[];
+  history?: { role: 'user' | 'model'; text: string }[];
+  action?: 'chat' | 'summarize';
+}): AsyncGenerator<string> {
+  const res = await fetch(`${WORKER_URL}/api/ai/document`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+
+  if (!res.ok || !res.body) {
+    const t = await res.text().catch(() => res.statusText);
+    throw new Error(`Document AI failed: ${res.status} ${t}`);
   }
 
-  const contents = [...history.map(h => ({ role: h.role, parts: [{ text: h.text }] })), { role: 'user', parts: [{ text: prompt }] }];
+  const reader = res.body.getReader();
+  const dec    = new TextDecoder();
+  let   buf    = '';
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-pro",
-    contents,
-    config
-  });
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-  return response.text;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop() ?? '';
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (raw === '[DONE]') return;
+
+      try {
+        const parsed = JSON.parse(raw);
+        const token  = parsed.choices?.[0]?.delta?.content;
+        if (token) yield token;
+      } catch {}
+    }
+  }
 }
 
-export async function askGeminiForDatabaseSchema(prompt: string) {
-  const ai = getAI();
-  const config: any = {
-    responseMimeType: "application/json",
-  };
-
-  const jsonSchemaInstruction = `
-You must return a valid JSON object with the following structure:
-{
-  "title": "String",
-  "schema": [
-    {
-      "key": "camelCaseString",
-      "name": "Human Readable Name",
-      "type": "text | select | date | status | number | checkbox | formula | relation",
-      "options": ["Option 1", "Option 2"] // Only for select/status
-    }
-  ],
-  "initialTasks": [
-    {
-      "title": "Main title of record",
-      "properties": {
-        "columnKey": "value",
-        "anotherColumn": "value"
-      }
-    }
-  ]
+// ─── DOCUMENT AI (convenience: collect full streamed text) ────────────────────
+/**
+ * Collects the entire streamed response into a single string.
+ * Drop-in replacement for the original askGemini() in document contexts.
+ */
+export async function askGemini(
+  _systemInstruction: string,   // ignored — system is set server-side
+  prompt: string,
+  _includeSchema = false,       // ignored
+  history: { role: 'user' | 'model'; text: string }[] = [],
+  blocks: { id: string; type: string; text: string }[] = [],
+  action: 'chat' | 'summarize' = 'chat',
+): Promise<string> {
+  let result = '';
+  for await (const token of streamDocumentAI({ message: prompt, blocks, history, action })) {
+    result += token;
+  }
+  return result;
 }
-`;
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-pro",
-    contents: `Task: ${prompt}\n\n${jsonSchemaInstruction}\n\nPlease generate a comprehensive and diverse database schema. \n- Use varied column types. Suggest more advanced column types like 'formula' or 'relation' if applicable to the topic, along with standard ones ('text', 'select', 'date', 'status', 'number', 'checkbox'). \n- Generate 10-15 high-quality, realistic initial records that make robust use of the schema columns.\n- Ensure accurate and varied realistic records, including YYYY-MM-DD dates within the next 30 days relative to today, more complex nested property structures for some records, perfectly matching select/status options, and vivid descriptions.`,
-    config
+// ─── DATABASE SCHEMA GENERATION (non-streaming) ───────────────────────────────
+/**
+ * Calls /api/ai/database on the Worker and returns the raw JSON string.
+ * Drop-in replacement for the original askGeminiForDatabaseSchema().
+ */
+export async function askGeminiForDatabaseSchema(prompt: string): Promise<string> {
+  const res = await fetch(`${WORKER_URL}/api/ai/database`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ prompt }),
   });
 
-  return response.text;
+  if (!res.ok) {
+    const t = await res.text().catch(() => res.statusText);
+    throw new Error(`Database AI failed: ${res.status} ${t}`);
+  }
+
+  const body = await res.json() as { ok: boolean; data: unknown; error?: string };
+  if (!body.ok) throw new Error(body.error || 'Database AI returned error');
+
+  // Return as JSON string so existing callers can pass it through safeJsonParse
+  return JSON.stringify(body.data);
 }
