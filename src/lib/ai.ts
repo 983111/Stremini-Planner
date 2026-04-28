@@ -1,101 +1,77 @@
 /**
  * src/lib/ai.ts
- * All AI calls now go through the Cloudflare Worker backend.
- * No Gemini API key needed on the frontend.
- *
- * Set VITE_WORKER_URL in your .env.local:
- *   VITE_WORKER_URL=https://taskflow-backend.<your-subdomain>.workers.dev
+ * All AI calls go through the Cloudflare Worker backend.
+ * Set VITE_WORKER_URL in .env.local:
+ *   VITE_WORKER_URL=https://your-worker.workers.dev
  */
 
-const WORKER_URL = import.meta.env.VITE_WORKER_URL || '';
+const WORKER_URL = (import.meta.env.VITE_WORKER_URL as string | undefined) || '';
 
 if (!WORKER_URL) {
   console.warn('[ai.ts] VITE_WORKER_URL is not set. AI calls will fail.');
 }
 
-// ─── JSON SAFE-PARSE (unchanged from original) ────────────────────────────────
+// ─── JSON SAFE-PARSE ──────────────────────────────────────────────────────────
+// Strips markdown fences and attempts multiple recovery strategies.
 
-export function safeJsonParse(jsonStr: string) {
-  const stripCodeFences = (input: string) => {
-    let text = input.trim();
-    if (text.startsWith('```json')) text = text.substring(7);
-    else if (text.startsWith('```')) text = text.substring(3);
-    if (text.endsWith('```')) text = text.substring(0, text.length - 3);
-    return text.trim();
-  };
+export function safeJsonParse(raw: string): any {
+  if (!raw || typeof raw !== 'string') return null;
 
-  const extractBalancedJson = (input: string) => {
-    const startCandidates = [input.indexOf('{'), input.indexOf('[')].filter(i => i >= 0);
-    if (startCandidates.length === 0) return null;
-    const start = Math.min(...startCandidates);
-    const opening = input[start];
-    const closing = opening === '{' ? '}' : ']';
+  let text = raw.trim();
 
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
+  // Strip ```json ... ``` or ``` ... ``` fences
+  if (text.startsWith('```json')) text = text.slice(7);
+  else if (text.startsWith('```'))  text = text.slice(3);
+  if (text.endsWith('```'))         text = text.slice(0, text.length - 3);
+  text = text.trim();
 
-    for (let i = start; i < input.length; i++) {
-      const ch = input[i];
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (ch === '\\') {
-        escaped = true;
-        continue;
-      }
-      if (ch === '"') {
-        inString = !inString;
-        continue;
-      }
-      if (inString) continue;
-      if (ch === opening) depth++;
-      if (ch === closing) depth--;
-      if (depth === 0) return input.slice(start, i + 1);
-    }
-    return input.slice(start);
-  };
+  // 1. Direct parse
+  try { return JSON.parse(text); } catch {}
 
-  let text = stripCodeFences(jsonStr);
-  const extracted = extractBalancedJson(text);
-  if (extracted) text = extracted;
+  // 2. Find first { ... } JSON object
+  const start = text.indexOf('{');
+  if (start !== -1) {
+    // Try from the first opening brace
+    const slice = text.slice(start);
+    try { return JSON.parse(slice); } catch {}
 
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    console.warn('JSON parse failed, attempting heuristic repair:', e);
-
-    const lastBrace   = text.lastIndexOf('}');
-    const lastBracket = text.lastIndexOf(']');
-    const lastValid   = Math.max(lastBrace, lastBracket);
-
-    if (lastValid > -1) {
-      const endings = ['', '}', ']', ']}', '}]', '}]}', ']}]', '"}', '"]}', '"}]'];
-      for (const end of endings) {
-        try { return JSON.parse(text.substring(0, lastValid + 1) + end); } catch {}
-      }
+    // 3. Find matching closing brace
+    const end = text.lastIndexOf('}');
+    if (end > start) {
+      try { return JSON.parse(text.slice(start, end + 1)); } catch {}
     }
 
-    try {
-      const safeCut = text.substring(0, text.lastIndexOf(','));
-      for (const end of ['}', ']', ']}', '}]']) {
-        try { return JSON.parse(safeCut + end); } catch {}
-      }
-    } catch {}
+    // 4. Truncation recovery — append common suffixes
+    const suffixes = [']}', '}]}', '"}]}', '"]}', '}]}}', '"]}}'];
+    for (const s of suffixes) {
+      try { return JSON.parse(slice + s); } catch {}
+    }
 
-    return { blocks: [], schema: [], error: true };
+    // 5. Walk backwards to last valid record
+    for (let i = text.length - 1; i > start; i--) {
+      if (text[i] !== '}') continue;
+      const candidates = [
+        text.slice(start, i + 1) + ']}',
+        text.slice(start, i + 1) + '\n  ]\n}',
+      ];
+      for (const c of candidates) {
+        try { return JSON.parse(c); } catch {}
+      }
+    }
   }
+
+  console.warn('[safeJsonParse] All recovery strategies failed. Length:', text.length);
+  return null;
 }
 
-// ─── DOCUMENT AI (streaming) ──────────────────────────────────────────────────
+// ─── DOCUMENT AI — STREAMING ──────────────────────────────────────────────────
 /**
  * Calls /api/ai/document on the Worker.
- * Returns an async generator that yields string tokens stripped of think blocks.
+ * Yields string tokens stripped of <think> blocks (handled server-side).
  *
  * Usage:
  *   for await (const token of streamDocumentAI({ message, blocks, history })) {
- *     // append token to UI
+ *     accumulated += token;
  *   }
  */
 export async function* streamDocumentAI(params: {
@@ -135,21 +111,33 @@ export async function* streamDocumentAI(params: {
       try {
         const parsed = JSON.parse(raw);
         const token  = parsed.choices?.[0]?.delta?.content;
-        if (token) yield token;
+        if (token) yield token as string;
+      } catch {}
+    }
+  }
+
+  // Flush any remaining buffer
+  if (buf.startsWith('data: ')) {
+    const raw = buf.slice(6).trim();
+    if (raw && raw !== '[DONE]') {
+      try {
+        const parsed = JSON.parse(raw);
+        const token  = parsed.choices?.[0]?.delta?.content;
+        if (token) yield token as string;
       } catch {}
     }
   }
 }
 
-// ─── DOCUMENT AI (convenience: collect full streamed text) ────────────────────
+// ─── DOCUMENT AI — COLLECT FULL TEXT (non-streaming wrapper) ─────────────────
 /**
- * Collects the entire streamed response into a single string.
- * Drop-in replacement for the original askGemini() in document contexts.
+ * Collects the full streamed response into a single string.
+ * Used where callers expect a Promise<string>.
  */
 export async function askGemini(
-  _systemInstruction: string,   // ignored — system is set server-side
+  _systemInstruction: string,   // ignored — set server-side
   prompt: string,
-  _includeSchema = false,       // ignored
+  _includeSchema = false,
   history: { role: 'user' | 'model'; text: string }[] = [],
   blocks: { id: string; type: string; text: string }[] = [],
   action: 'chat' | 'summarize' = 'chat',
@@ -161,10 +149,10 @@ export async function askGemini(
   return result;
 }
 
-// ─── DATABASE SCHEMA GENERATION (non-streaming) ───────────────────────────────
+// ─── DATABASE SCHEMA GENERATION — NON-STREAMING ───────────────────────────────
 /**
- * Calls /api/ai/database on the Worker and returns the raw JSON string.
- * Drop-in replacement for the original askGeminiForDatabaseSchema().
+ * Calls /api/ai/database on the Worker.
+ * Returns the AI's parsed JSON object as a string (pass through safeJsonParse).
  */
 export async function askGeminiForDatabaseSchema(prompt: string): Promise<string> {
   const res = await fetch(`${WORKER_URL}/api/ai/database`, {
@@ -179,8 +167,8 @@ export async function askGeminiForDatabaseSchema(prompt: string): Promise<string
   }
 
   const body = await res.json() as { ok: boolean; data: unknown; error?: string };
-  if (!body.ok) throw new Error(body.error || 'Database AI returned error');
+  if (!body.ok) throw new Error(body.error || 'Database AI returned an error');
 
-  // Return as JSON string so existing callers can pass it through safeJsonParse
+  // Return as JSON string so callers can pass it through safeJsonParse
   return JSON.stringify(body.data);
 }
