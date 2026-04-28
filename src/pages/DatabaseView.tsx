@@ -9,7 +9,6 @@ import { format } from "date-fns";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../components/ui/dialog';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '../components/ui/select';
 
 export function DatabaseView() {
   const { pageId } = useParams();
@@ -271,18 +270,17 @@ export function DatabaseView() {
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">Column Type</label>
-              <Select value={newColType} onValueChange={setNewColType}>
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="text">Text</SelectItem>
-                  <SelectItem value="number">Number</SelectItem>
-                  <SelectItem value="checkbox">Checkbox</SelectItem>
-                  <SelectItem value="select">Select / Status</SelectItem>
-                  <SelectItem value="date">Date</SelectItem>
-                </SelectContent>
-              </Select>
+              <select
+                value={newColType}
+                onChange={e => setNewColType(e.target.value)}
+                className="flex h-10 w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-purple-500"
+              >
+                <option value="text">Text</option>
+                <option value="number">Number</option>
+                <option value="checkbox">Checkbox</option>
+                <option value="select">Select / Status</option>
+                <option value="date">Date</option>
+              </select>
             </div>
             {(newColType === 'select' || newColType === 'status') && (
               <div className="space-y-2">
