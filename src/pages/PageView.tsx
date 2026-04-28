@@ -4,13 +4,96 @@ import { doc, onSnapshot, updateDoc, serverTimestamp } from "firebase/firestore"
 import { db } from "../lib/firebase";
 import { handleFirestoreError, OperationType } from "../lib/api";
 import { v4 as uuidv4 } from "uuid";
-import { Sparkles, FileText, CheckCircle2, Circle } from "lucide-react";
+import { Sparkles, CheckCircle2, Circle, Code2 } from "lucide-react";
 import { askGemini, safeJsonParse } from "../lib/ai";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '../components/ui/dialog';
 import { Button } from '../components/ui/button';
 import { Input } from '../components/ui/input';
 
 type Block = { id: string; type: string; text: string };
+type ChatMessage = { role: 'user' | 'model', text: string };
+
+const getBlockPlaceholder = (type: string) => {
+  if (type === 'h1') return 'Heading 1';
+  if (type === 'h2') return 'Heading 2';
+  if (type === 'quote') return 'Quote';
+  if (type === 'code') return 'Code block';
+  if (type === 'callout') return 'Callout';
+  return "Type '/' for commands...";
+};
+
+const getBlockClassName = (block: Block) => {
+  if (block.type === 'h1') return 'text-3xl font-bold tracking-tight mt-8 mb-4 text-zinc-900';
+  if (block.type === 'h2') return 'text-2xl font-semibold tracking-tight mt-6 mb-3 text-zinc-800';
+  if (block.type === 'quote') return 'text-base italic leading-relaxed border-l-4 border-zinc-300 pl-4 text-zinc-600';
+  if (block.type === 'code') return 'text-sm font-mono leading-6 bg-zinc-900 text-zinc-100 rounded-md px-3 py-2';
+  if (block.type === 'callout') return 'text-base leading-relaxed bg-amber-50 border border-amber-200 rounded-md px-3 py-2 text-amber-900';
+  return 'text-base leading-relaxed';
+};
+
+const renderMarkdownText = (text: string) => {
+  const lines = text.split('\n');
+  const elements: React.ReactNode[] = [];
+  let inCode = false;
+  let codeBuffer: string[] = [];
+  let listBuffer: string[] = [];
+
+  const flushList = () => {
+    if (!listBuffer.length) return;
+    elements.push(
+      <ul key={`list-${elements.length}`} className="list-disc list-inside space-y-1">
+        {listBuffer.map((item, idx) => <li key={idx}>{item}</li>)}
+      </ul>
+    );
+    listBuffer = [];
+  };
+
+  const flushCode = () => {
+    if (!codeBuffer.length) return;
+    elements.push(
+      <pre key={`code-${elements.length}`} className="bg-zinc-900 text-zinc-100 text-xs rounded-md p-3 overflow-x-auto font-mono">
+        {codeBuffer.join('\n')}
+      </pre>
+    );
+    codeBuffer = [];
+  };
+
+  for (const line of lines) {
+    if (line.trim().startsWith('```')) {
+      if (inCode) {
+        flushCode();
+        inCode = false;
+      } else {
+        flushList();
+        inCode = true;
+      }
+      continue;
+    }
+
+    if (inCode) {
+      codeBuffer.push(line);
+      continue;
+    }
+
+    if (line.startsWith('- ')) {
+      listBuffer.push(line.slice(2));
+      continue;
+    }
+
+    flushList();
+
+    if (!line.trim()) continue;
+    if (line.startsWith('## ')) elements.push(<h4 key={`h4-${elements.length}`} className="font-semibold text-zinc-800">{line.slice(3)}</h4>);
+    else if (line.startsWith('# ')) elements.push(<h3 key={`h3-${elements.length}`} className="font-semibold text-zinc-900">{line.slice(2)}</h3>);
+    else elements.push(<p key={`p-${elements.length}`} className="leading-relaxed">{line}</p>);
+  }
+
+  flushList();
+  if (inCode) flushCode();
+
+  if (!elements.length) return <span>{text}</span>;
+  return <div className="space-y-2">{elements}</div>;
+};
 
 export function PageView() {
   const { pageId } = useParams();
@@ -21,8 +104,9 @@ export function PageView() {
   const [aiPanelOpen, setAiPanelOpen] = useState(false);
   const [aiPrompt, setAiPrompt] = useState('');
   const [isGenerating, setIsGenerating] = useState(false);
-  const [chatHistory, setChatHistory] = useState<{ role: 'user' | 'model', text: string }[]>([]);
+  const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [streamingPreview, setStreamingPreview] = useState('');
 
   useEffect(() => {
     if (!pageId) return;
@@ -83,6 +167,12 @@ export function PageView() {
         newBlocks[index] = { ...newBlocks[index], text: text.slice(3), type: 'h2' };
       } else if (text.startsWith('- ')) {
         newBlocks[index] = { ...newBlocks[index], text: text.slice(2), type: 'list' };
+      } else if (text.startsWith('> ')) {
+        newBlocks[index] = { ...newBlocks[index], text: text.slice(2), type: 'quote' };
+      } else if (text.startsWith('```')) {
+        newBlocks[index] = { ...newBlocks[index], text: text.replace(/^```/, '').trim(), type: 'code' };
+      } else if (text.startsWith('! ')) {
+        newBlocks[index] = { ...newBlocks[index], text: text.slice(2), type: 'callout' };
       } else if (text.startsWith('[] ')) {
         newBlocks[index] = { ...newBlocks[index], text: text.slice(3), type: 'todo' };
       }
@@ -108,6 +198,7 @@ export function PageView() {
     const userPrompt = aiPrompt;
     setChatHistory(h => [...h, { role: 'user', text: userPrompt }]);
     setAiPrompt('');
+    setStreamingPreview('');
 
     try {
       const contentStr = blocks.map(b => `[${b.type}] ${b.text}`).join('\n');
@@ -119,6 +210,7 @@ Task: Return ONLY a valid JSON object matching the requested schema. If the user
       
       const res = await askGemini(instruction, userPrompt, true, chatHistory);
       const parsed = safeJsonParse(res);
+      setStreamingPreview(res);
       
       if (parsed && Array.isArray(parsed.blocks)) {
         let newBlocks = blocks;
@@ -249,12 +341,8 @@ Task: Return ONLY a valid JSON object matching the requested schema with action 
                   target.style.height = 'auto';
                   target.style.height = target.scrollHeight + 'px';
                 }}
-                className={`w-full bg-transparent outline-none resize-none py-2 min-h-[38px] text-zinc-800 placeholder-zinc-300 overflow-hidden ${
-                  block.type === 'h1' ? 'text-3xl font-bold tracking-tight mt-8 mb-4 text-zinc-900' :
-                  block.type === 'h2' ? 'text-2xl font-semibold tracking-tight mt-6 mb-3 text-zinc-800' :
-                  'text-base leading-relaxed'
-                } ${block.type === 'todo' && block.text.startsWith('[x]') ? 'line-through text-zinc-400' : ''}`}
-                placeholder={block.type === 'h1' ? 'Heading 1' : block.type === 'h2' ? 'Heading 2' : "Type '/' for commands..."}
+                className={`w-full bg-transparent outline-none resize-none py-2 min-h-[38px] text-zinc-800 placeholder-zinc-300 overflow-hidden ${getBlockClassName(block)} ${block.type === 'todo' && block.text.startsWith('[x]') ? 'line-through text-zinc-400' : ''}`}
+                placeholder={getBlockPlaceholder(block.type)}
               />
             </div>
           ))}
@@ -289,7 +377,7 @@ Task: Return ONLY a valid JSON object matching the requested schema with action 
                 <div className={`text-sm py-2 px-3 rounded-lg max-w-[90%] ${
                   msg.role === 'user' ? 'bg-purple-600 text-white' : 'bg-white border border-zinc-200 text-zinc-800'
                 }`}>
-                  {msg.text}
+                  {msg.role === 'model' ? renderMarkdownText(msg.text) : msg.text}
                 </div>
               </div>
             ))}
@@ -302,6 +390,14 @@ Task: Return ONLY a valid JSON object matching the requested schema with action 
                     <div className="w-2 h-2 bg-purple-300 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
                   </div>
                   <span className="text-xs font-medium animate-pulse">AI is thinking...</span>
+                </div>
+              </div>
+            )}
+            {streamingPreview && (
+              <div className="flex justify-start">
+                <div className="bg-white border border-zinc-200 text-zinc-700 text-xs py-2 px-3 rounded-lg max-w-[90%] space-y-1">
+                  <div className="font-medium flex items-center gap-1 text-zinc-500"><Code2 className="w-3 h-3" /> Live JSON preview</div>
+                  <pre className="whitespace-pre-wrap break-words max-h-24 overflow-y-auto">{streamingPreview}</pre>
                 </div>
               </div>
             )}

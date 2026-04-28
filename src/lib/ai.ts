@@ -16,11 +16,50 @@ if (!WORKER_URL) {
 // ─── JSON SAFE-PARSE (unchanged from original) ────────────────────────────────
 
 export function safeJsonParse(jsonStr: string) {
-  let text = jsonStr.trim();
-  if (text.startsWith('```json')) text = text.substring(7);
-  else if (text.startsWith('```'))  text = text.substring(3);
-  if (text.endsWith('```'))         text = text.substring(0, text.length - 3);
-  text = text.trim();
+  const stripCodeFences = (input: string) => {
+    let text = input.trim();
+    if (text.startsWith('```json')) text = text.substring(7);
+    else if (text.startsWith('```')) text = text.substring(3);
+    if (text.endsWith('```')) text = text.substring(0, text.length - 3);
+    return text.trim();
+  };
+
+  const extractBalancedJson = (input: string) => {
+    const startCandidates = [input.indexOf('{'), input.indexOf('[')].filter(i => i >= 0);
+    if (startCandidates.length === 0) return null;
+    const start = Math.min(...startCandidates);
+    const opening = input[start];
+    const closing = opening === '{' ? '}' : ']';
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = start; i < input.length; i++) {
+      const ch = input[i];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (ch === opening) depth++;
+      if (ch === closing) depth--;
+      if (depth === 0) return input.slice(start, i + 1);
+    }
+    return input.slice(start);
+  };
+
+  let text = stripCodeFences(jsonStr);
+  const extracted = extractBalancedJson(text);
+  if (extracted) text = extracted;
 
   try {
     return JSON.parse(text);
@@ -32,7 +71,7 @@ export function safeJsonParse(jsonStr: string) {
     const lastValid   = Math.max(lastBrace, lastBracket);
 
     if (lastValid > -1) {
-      const endings = ['', '}', ']', ']}', '}]', '}]}', ']}]', '"}', '"]}'];
+      const endings = ['', '}', ']', ']}', '}]', '}]}', ']}]', '"}', '"]}', '"}]'];
       for (const end of endings) {
         try { return JSON.parse(text.substring(0, lastValid + 1) + end); } catch {}
       }
