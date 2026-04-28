@@ -13,8 +13,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from './ui/dropdown-menu';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from './ui/dialog';
 import { Input } from './ui/input';
-import { askGeminiForDatabaseSchema, safeJsonParse } from '../lib/ai';
 import { TEMPLATES } from '../lib/templates';
+import { buildWorkspaceBlueprint } from '../lib/workspacePlanner';
 
 const getCategoryIcon = (category: string) => {
   if (category.includes('Work'))      return <Briefcase className="w-4 h-4 text-zinc-400" />;
@@ -94,40 +94,52 @@ export function Sidebar() {
     setIsGenerating(true);
     setGenError('');
     setGenSteps([
-      { label: 'Designing schema…', done: false },
-      { label: 'Building records…', done: false },
-      { label: 'Saving to workspace…', done: false },
+      { label: 'Understanding your intent…', done: false },
+      { label: 'Creating linked pages & databases…', done: false },
+      { label: 'Populating tasks, reminders, and milestones…', done: false },
+      { label: 'Saving workspace automation…', done: false },
     ]);
 
     try {
-      const res = await askGeminiForDatabaseSchema(
-        `Create a Notion-like database schema for: "${aiPrompt}". ` +
-        `Provide a relevant title, 4-8 schema columns with a good mix of types ` +
-        `(text, select, status, date, number, checkbox). ` +
-        `Ensure realistic and varied select/status options and 10-15 diverse records.`
-      );
+      const blueprint = buildWorkspaceBlueprint(aiPrompt);
       tickStep(0);
 
-      const data = safeJsonParse(res) || {};
-      const schema = (Array.isArray(data.schema) ? data.schema : []).map((c: any) => ({
-        key: c.key || c.name?.toLowerCase().replace(/\s+/g, '') || uuidv4().slice(0, 6),
-        name: c.name || 'Untitled',
-        type: c.type || 'text',
-        options: c.options || [],
-      }));
+      const dashboardBlocks = [
+        ...blueprint.dashboardBlocks,
+        ...blueprint.proactiveSuggestions.map((suggestion) => ({
+          id: uuidv4().slice(0, 8),
+          type: 'quote',
+          text: suggestion,
+        })),
+      ];
+
+      const dashboardDoc = await addDoc(collection(db, 'pages'), {
+        title: blueprint.title,
+        type: 'document',
+        blocks: JSON.stringify(dashboardBlocks),
+        schema: '{}',
+        ownerId: user.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
 
       tickStep(1);
 
-      const dbDoc = await addDoc(collection(db, 'pages'), {
-        title: data.title || aiPrompt,
-        type: 'database', blocks: '[]',
-        schema: JSON.stringify(schema),
-        ownerId: user.uid,
-        createdAt: serverTimestamp(), updatedAt: serverTimestamp(),
-      });
+      let firstDatabaseId = '';
+      for (const dbTemplate of blueprint.databases) {
+        const dbDoc = await addDoc(collection(db, 'pages'), {
+          title: dbTemplate.title,
+          type: 'database',
+          blocks: '[]',
+          schema: JSON.stringify(dbTemplate.schema),
+          ownerId: user.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
 
-      if (Array.isArray(data.initialTasks) && data.initialTasks.length > 0) {
-        for (const task of data.initialTasks) {
+        if (!firstDatabaseId) firstDatabaseId = dbDoc.id;
+
+        for (const task of dbTemplate.records) {
           await addDoc(collection(db, 'records'), {
             title: task.title || 'Untitled',
             databaseId: dbDoc.id,
@@ -138,7 +150,28 @@ export function Sidebar() {
         }
       }
 
+      const firstGoal = blueprint.databases[0]?.schema.find((col) => col.key === 'goal')?.options?.[0] || '';
+      await addDoc(collection(db, 'records'), {
+        title: 'Workspace hub',
+        databaseId: firstDatabaseId,
+        properties: JSON.stringify({
+          category: 'Review',
+          goal: firstGoal,
+          priority: 'Medium',
+          status: 'To Do',
+          deadline: '',
+          reminder_date: '',
+          effort_hours: 1,
+          linked_dashboard_id: dashboardDoc.id,
+        }),
+        blocks: '[]',
+        ownerId: user.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+
       tickStep(2);
+      tickStep(3);
 
       // Brief pause so user sees all steps complete
       await new Promise(r => setTimeout(r, 600));
@@ -146,7 +179,7 @@ export function Sidebar() {
       setIsAiDialogOpen(false);
       setAiPrompt('');
       setGenSteps([]);
-      navigate(`/database/${dbDoc.id}`);
+      navigate(`/page/${dashboardDoc.id}`);
     } catch (e: any) {
       console.error(e);
       setGenError(e.message || 'AI generation failed. Please try again.');
