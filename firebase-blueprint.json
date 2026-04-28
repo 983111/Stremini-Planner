@@ -1,0 +1,45 @@
+{
+  "entities": {
+    "Page": {
+      "title": "Page",
+      "description": "Represents a Notion-like document or database schema.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "icon": { "type": "string" },
+        "type": { "type": "string", "enum": ["document", "database"] },
+        "blocks": { "type": "string", "description": "JSON stringified array of blocks" },
+        "schema": { "type": "string", "description": "JSON stringified array of schema for database columns" },
+        "ownerId": { "type": "string" },
+        "createdAt": { "type": "number", "description": "Timestamp" },
+        "updatedAt": { "type": "number", "description": "Timestamp" }
+      },
+      "required": ["title", "type", "blocks", "ownerId", "createdAt", "updatedAt"]
+    },
+    "Record": {
+      "title": "Record",
+      "description": "Represents a row/task in a database.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string" },
+        "databaseId": { "type": "string" },
+        "properties": { "type": "string", "description": "JSON stringified object for property values" },
+        "blocks": { "type": "string", "description": "JSON stringified array of blocks for content inside the record" },
+        "ownerId": { "type": "string" },
+        "createdAt": { "type": "number", "description": "Timestamp" },
+        "updatedAt": { "type": "number", "description": "Timestamp" }
+      },
+      "required": ["title", "databaseId", "properties", "blocks", "ownerId", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/pages/{pageId}": {
+      "schema": "Page",
+      "description": "Collection of documents and databases."
+    },
+    "/records/{recordId}": {
+      "schema": "Record",
+      "description": "Collection of database rows/tasks."
+    }
+  }
+}

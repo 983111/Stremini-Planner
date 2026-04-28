@@ -1,0 +1,6 @@
+{
+  "name": "TaskFlow - Notion-like Tracker",
+  "description": "A Notion-like task tracker that allows users to create databases and pages manually or via AI, using Firebase for persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

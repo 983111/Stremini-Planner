@@ -1,0 +1,82 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() { return request.auth != null; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isValidId(id) { 
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+
+    function isValidPage(data) {
+      return data.keys().hasAll(['title', 'type', 'ownerId', 'updatedAt'])
+        && data.title is string && data.title.size() <= 200
+        && (data.type == 'document' || data.type == 'database')
+        && (!('blocks' in data) || (data.blocks is string && data.blocks.size() <= 100000))
+        && (!('schema' in data) || (data.schema is string && data.schema.size() <= 10000))
+        && (!('icon' in data) || (data.icon is string && data.icon.size() <= 100))
+        && data.ownerId == request.auth.uid;
+    }
+
+    match /pages/{pageId} {
+      allow read, list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      
+      allow create: if isSignedIn() 
+        && isValidId(pageId)
+        && isValidPage(incoming())
+        && (!('createdAt' in incoming()) || incoming().createdAt == request.time)
+        && incoming().updatedAt == request.time;
+        
+      allow update: if isSignedIn()
+        && isValidId(pageId)
+        && existing().ownerId == request.auth.uid
+        && isValidPage(incoming())
+        && incoming().ownerId == existing().ownerId
+        && (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt)
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'icon', 'type', 'blocks', 'schema', 'updatedAt']);
+        
+      allow delete: if isSignedIn() && isValidId(pageId) && existing().ownerId == request.auth.uid;
+    }
+
+    function isValidRecord(data) {
+      return data.keys().hasAll(['title', 'databaseId', 'ownerId', 'updatedAt'])
+        && data.title is string && data.title.size() <= 200
+        && data.databaseId is string && data.databaseId.size() <= 128
+        && (!('properties' in data) || (data.properties is string && data.properties.size() <= 50000))
+        && (!('blocks' in data) || (data.blocks is string && data.blocks.size() <= 100000))
+        && data.ownerId == request.auth.uid;
+    }
+
+    match /records/{recordId} {
+      allow read, list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      
+      allow create: if isSignedIn() 
+        && isValidId(recordId)
+        && isValidRecord(incoming())
+        // Enforce valid database ownership via get
+        && get(/databases/$(database)/documents/pages/$(incoming().databaseId)).data.ownerId == request.auth.uid
+        && (!('createdAt' in incoming()) || incoming().createdAt == request.time)
+        && incoming().updatedAt == request.time;
+        
+      allow update: if isSignedIn()
+        && isValidId(recordId)
+        && existing().ownerId == request.auth.uid
+        && isValidRecord(incoming())
+        && incoming().ownerId == existing().ownerId
+        && incoming().databaseId == existing().databaseId
+        && (!('createdAt' in existing()) || incoming().createdAt == existing().createdAt)
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'properties', 'blocks', 'updatedAt']);
+        
+      allow delete: if isSignedIn() && isValidId(recordId) && existing().ownerId == request.auth.uid;
+    }
+  }
+}
