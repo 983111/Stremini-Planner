@@ -117,6 +117,28 @@ export function DatabaseView() {
     return () => { unsubPage(); unsubRecords(); };
   }, [pageId, user]);
 
+  useEffect(() => {
+    if (!records.length || !schema.length) return;
+    const statusCol = schema.find((col) => col.type === 'status');
+    const dateCol = schema.find((col) => col.type === 'date');
+    if (!statusCol || !dateCol) return;
+
+    const today = new Date().toISOString().slice(0, 10);
+    records.forEach((record) => {
+      try {
+        const props = JSON.parse(record.properties || '{}');
+        const currentStatus = String(props[statusCol.key] || '').toLowerCase();
+        const deadline = String(props[dateCol.key] || '');
+        if (!deadline) return;
+        if (deadline < today && !['done', 'complete', 'completed', 'overdue'].includes(currentStatus)) {
+          updateRecordProp(record.id, record.properties, statusCol.key, 'Overdue');
+        }
+      } catch {
+        // ignore malformed properties
+      }
+    });
+  }, [records, schema]);
+
   const updateTitle = async (t: string) => {
     if (!pageId) return;
     setPage({ ...page, title: t });
